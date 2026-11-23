@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="accent_blue">#00BCD4</color>
+    <color name="accent_orange">#F59E0B</color>
+    <color name="accent_red">#EF4444</color>
+    <color name="bg_dark">#0F172A</color>
+    <color name="card_bg">#1E293B</color>
+    <color name="card_stroke">#334155</color>
+    <color name="primary">#00E676</color>
+    <color name="primary_variant">#00B359</color>
+    <color name="text_dim">#64748B</color>
+    <color name="text_muted">#94A3B8</color>
+    <color name="text_white">#F8FAFC</color>
+    <string name="app_name">Lung Stethoscope</string>
+    <style name="Theme.LungSoundSteth" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/accent_blue</item>
+        <item name="colorPrimaryVariant">@color/primary_variant</item>
+        <item name="colorOnPrimary">@color/text_white</item>
+        <item name="colorSecondary">@color/primary</item>
+        <item name="colorSecondaryVariant">@color/primary_variant</item>
+        <item name="colorOnSecondary">#000000</item>
+        <item name="android:statusBarColor">@color/bg_dark</item>
+        <item name="android:windowBackground">@color/bg_dark</item>
+    </style>
+</resources>
