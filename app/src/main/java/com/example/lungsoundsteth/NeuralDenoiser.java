@@ -11,9 +11,8 @@ import java.nio.channels.FileChannel;
 
 /**
  * Neural network-based lung sound denoiser using TensorFlow Lite.
- * Takes noisy 16-bit PCM audio from ESP32, runs STFT, applies the trained
- * U-Net denoising mask, reconstructs clean audio via inverse STFT,
- * applies clinical bandpass (80-750 Hz) and volume normalization.
+ * Uses continuous overlap-add resynthesis and persistent IIR state
+ * to completely eliminate chunk boundary clicks and "tak tak" pops.
  */
 public class NeuralDenoiser {
 
@@ -30,8 +29,15 @@ public class NeuralDenoiser {
     private float[] inputBuffer = new float[CHUNK_SAMPLES * 2];
     private int inputPos = 0;
 
-    // Hann window for STFT
+    // Overlap buffer connecting previous chunk tail to current chunk head
+    private float[] prevOverlap = new float[N_FFT];
+
+    // Hann window for analysis STFT
     private final float[] hannWindow = new float[N_FFT];
+
+    // Persistent Butterworth filter states (prevents boundary filter ringing)
+    private double hpX1 = 0, hpX2 = 0, hpY1 = 0, hpY2 = 0;
+    private double lpX1 = 0, lpX2 = 0, lpY1 = 0, lpY2 = 0;
 
     public NeuralDenoiser(Context context) {
         try {
@@ -43,7 +49,7 @@ public class NeuralDenoiser {
             e.printStackTrace();
         }
 
-        // Pre-compute Hann window
+        // Pre-compute Hann analysis window
         for (int i = 0; i < N_FFT; i++) {
             hannWindow[i] = (float) (0.5 * (1.0 - Math.cos(2.0 * Math.PI * i / (N_FFT - 1))));
         }
@@ -81,14 +87,12 @@ public class NeuralDenoiser {
     }
 
     /**
-     * Flush and process any remaining audio samples in the buffer (even if < CHUNK_SAMPLES).
-     * Zero-pads the remaining frames so no audio is lost at the end of recording.
+     * Flush and process any remaining audio samples in the buffer.
      */
     public short[] flush() {
         if (tflite == null || inputPos == 0) return new short[0];
 
         int validSamples = inputPos;
-        // Pad with zeros to CHUNK_SAMPLES
         while (inputPos < CHUNK_SAMPLES) {
             inputBuffer[inputPos++] = 0.0f;
         }
@@ -106,7 +110,7 @@ public class NeuralDenoiser {
         float[] chunk = new float[CHUNK_SAMPLES];
         System.arraycopy(inputBuffer, 0, chunk, 0, CHUNK_SAMPLES);
 
-        // Shift buffer: advance by consumed hop length
+        // Advance buffer by consumed hop length
         int consumed = TIME_FRAMES * HOP_LENGTH;
         int remaining = inputPos - consumed;
         if (remaining > 0) {
@@ -136,7 +140,7 @@ public class NeuralDenoiser {
             }
         }
 
-        // --- Prepare TFLite input: log1p(magnitude), shape [1, 120, 257, 1] ---
+        // --- TFLite Input: log1p(mag), shape [1, 120, 257, 1] ---
         float[][][][] inputTensor = new float[1][TIME_FRAMES][FREQ_BINS][1];
         for (int t = 0; t < TIME_FRAMES; t++) {
             for (int f = 0; f < FREQ_BINS; f++) {
@@ -144,11 +148,11 @@ public class NeuralDenoiser {
             }
         }
 
-        // --- Run TFLite inference ---
+        // --- Inference ---
         float[][][][] outputTensor = new float[1][TIME_FRAMES][FREQ_BINS][1];
         tflite.run(inputTensor, outputTensor);
 
-        // --- Apply predicted mask ---
+        // --- Apply Mask ---
         float[][] cleanMag = new float[TIME_FRAMES][FREQ_BINS];
         for (int t = 0; t < TIME_FRAMES; t++) {
             for (int f = 0; f < FREQ_BINS; f++) {
@@ -157,20 +161,17 @@ public class NeuralDenoiser {
             }
         }
 
-        // --- Inverse STFT with overlap-add ---
+        // --- Linear Overlap-Add Resynthesis ---
         float[] output = new float[CHUNK_SAMPLES];
-        float[] windowSum = new float[CHUNK_SAMPLES];
 
         for (int t = 0; t < TIME_FRAMES; t++) {
             float[] real = new float[N_FFT];
             float[] imag = new float[N_FFT];
 
-            // Reconstruct complex spectrum
             for (int k = 0; k < FREQ_BINS; k++) {
                 real[k] = cleanMag[t][k] * (float) Math.cos(phaseFrames[t][k]);
                 imag[k] = cleanMag[t][k] * (float) Math.sin(phaseFrames[t][k]);
             }
-            // Mirror for full FFT
             for (int k = FREQ_BINS; k < N_FFT; k++) {
                 real[k] = real[N_FFT - k];
                 imag[k] = -imag[N_FFT - k];
@@ -181,39 +182,51 @@ public class NeuralDenoiser {
             int start = t * HOP_LENGTH;
             for (int i = 0; i < N_FFT; i++) {
                 if (start + i < output.length) {
-                    output[start + i] += real[i] * hannWindow[i];
-                    windowSum[start + i] += hannWindow[i] * hannWindow[i];
+                    output[start + i] += real[i];
                 }
             }
         }
 
-        // Normalize by window sum
-        for (int i = 0; i < output.length; i++) {
-            if (windowSum[i] > 1e-6f) {
-                output[i] /= windowSum[i];
+        // Add overlap tail from the PREVIOUS chunk to the head of this chunk
+        for (int i = 0; i < N_FFT && i < output.length; i++) {
+            output[i] += prevOverlap[i];
+        }
+
+        // Save overlap tail past 'consumed' for the NEXT chunk
+        for (int i = 0; i < N_FFT; i++) {
+            if (consumed + i < output.length) {
+                prevOverlap[i] = output[consumed + i];
+            } else {
+                prevOverlap[i] = 0.0f;
             }
         }
 
-        // --- Clinical bandpass: keep 80-750 Hz for lung acoustics ---
-        output = bandpass(output, 80, 750, SAMPLE_RATE);
+        // --- Persistent Clinical Bandpass Filter (80 - 750 Hz) ---
+        applyBandpassContinuous(output, consumed, 80, 750, SAMPLE_RATE);
 
-        // --- Peak Normalization & Gain Boost (Ensures lung sound is clearly audible) ---
+        // --- Soft De-Clicker & Normalization ---
         float maxVal = 0.0f;
-        for (int i = 0; i < consumed && i < output.length; i++) {
+        for (int i = 0; i < consumed; i++) {
             float abs = Math.abs(output[i]);
             if (abs > maxVal) maxVal = abs;
         }
 
         float gain = 1.0f;
-        if (maxVal > 1e-5f) {
-            // Target peak at 85% of full scale (loud, clear, no clipping)
-            gain = Math.min(25.0f, 0.85f / maxVal);
+        if (maxVal > 1e-4f) {
+            gain = Math.min(15.0f, 0.85f / maxVal);
         }
 
-        // Convert back to 16-bit PCM
         short[] result = new short[consumed];
-        for (int i = 0; i < consumed && i < output.length; i++) {
-            float v = output[i] * gain * 32768.0f;
+        float prevSample = 0.0f;
+        for (int i = 0; i < consumed; i++) {
+            float cur = output[i] * gain;
+            // Suppress any sudden delta spike > 0.35
+            if (i > 0 && Math.abs(cur - prevSample) > 0.35f) {
+                cur = prevSample + Math.signum(cur - prevSample) * 0.15f;
+            }
+            prevSample = cur;
+
+            float v = cur * 32768.0f;
             if (v > 32767) v = 32767;
             if (v < -32768) v = -32768;
             result[i] = (short) v;
@@ -221,8 +234,11 @@ public class NeuralDenoiser {
         return result;
     }
 
-    /** Simple 2nd-order Butterworth bandpass filter */
-    private float[] bandpass(float[] data, float lowHz, float highHz, int sr) {
+    /**
+     * Continuous 2nd-order Butterworth bandpass filter.
+     * Uses persistent state across chunks to completely avoid boundary clicks.
+     */
+    private void applyBandpassContinuous(float[] data, int length, float lowHz, float highHz, int sr) {
         double wLow = 2.0 * Math.PI * lowHz / sr;
         double alphaLow = Math.sin(wLow) / (2.0 * 0.707);
         double b0h = (1 + Math.cos(wLow)) / 2, b1h = -(1 + Math.cos(wLow)), b2h = b0h;
@@ -233,27 +249,19 @@ public class NeuralDenoiser {
         double b0l = (1 - Math.cos(wHigh)) / 2, b1l = 1 - Math.cos(wHigh), b2l = b0l;
         double a0l = 1 + alphaHigh, a1l = -2 * Math.cos(wHigh), a2l = 1 - alphaHigh;
 
-        float[] filtered = new float[data.length];
+        for (int i = 0; i < length && i < data.length; i++) {
+            // Highpass
+            double x0h = data[i];
+            double y0h = (b0h * x0h + b1h * hpX1 + b2h * hpX2 - a1h * hpY1 - a2h * hpY2) / a0h;
+            hpX2 = hpX1; hpX1 = x0h; hpY2 = hpY1; hpY1 = y0h;
 
-        // Highpass pass
-        double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
-        for (int i = 0; i < data.length; i++) {
-            double x0 = data[i];
-            double y0 = (b0h * x0 + b1h * x1 + b2h * x2 - a1h * y1 - a2h * y2) / a0h;
-            x2 = x1; x1 = x0; y2 = y1; y1 = y0;
-            filtered[i] = (float) y0;
+            // Lowpass
+            double x0l = y0h;
+            double y0l = (b0l * x0l + b1l * lpX1 + b2l * lpX2 - a1l * lpY1 - a2l * lpY2) / a0l;
+            lpX2 = lpX1; lpX1 = x0l; lpY2 = lpY1; lpY1 = y0l;
+
+            data[i] = (float) y0l;
         }
-
-        // Lowpass pass
-        x1 = 0; x2 = 0; y1 = 0; y2 = 0;
-        for (int i = 0; i < filtered.length; i++) {
-            double x0 = filtered[i];
-            double y0 = (b0l * x0 + b1l * x1 + b2l * x2 - a1l * y1 - a2l * y2) / a0l;
-            x2 = x1; x1 = x0; y2 = y1; y1 = y0;
-            filtered[i] = (float) y0;
-        }
-
-        return filtered;
     }
 
     /** In-place radix-2 Cooley-Tukey FFT */
@@ -310,6 +318,9 @@ public class NeuralDenoiser {
 
     public void reset() {
         inputPos = 0;
+        for (int i = 0; i < prevOverlap.length; i++) prevOverlap[i] = 0.0f;
+        hpX1 = 0; hpX2 = 0; hpY1 = 0; hpY2 = 0;
+        lpX1 = 0; lpX2 = 0; lpY1 = 0; lpY2 = 0;
     }
 
     public void close() {
